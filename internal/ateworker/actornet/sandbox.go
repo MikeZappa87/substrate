@@ -89,14 +89,16 @@ func SetupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig) (_ *Sand
 			_ = netns.RemoveNamed(actorNSName)
 		}
 	}()
-	if err := netns.Do(ctx, actorNS, prepareNamespace); err != nil {
-		return nil, err
-	}
-
-	if cfg.Veth {
-		if err := setupVethPair(ctx, actorNS); err != nil {
-			return nil, err
+	if err := netns.Do(ctx, actorNS, func(ctx context.Context) error {
+		if err := prepareNamespace(ctx); err != nil {
+			return err
 		}
+		if cfg.Veth {
+			return setupVethPair()
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if err := installEgressRules(actorNS, cfg.EgressPort); err != nil {
 		return nil, err
@@ -162,34 +164,37 @@ var sandboxSysctls = []netns.Sysctl{
 }
 
 // setupVethPair leaves atside addressless so runsc imports only eth0.
-func setupVethPair(ctx context.Context, actorNS netns.Handle) error {
-	return netns.Do(ctx, actorNS, func(context.Context) error {
-		veth := &netlink.Veth{
-			LinkAttrs: netlink.LinkAttrs{Name: gatewayVethName},
-			PeerName:  ActorVethName,
-		}
-		if err := netlink.LinkAdd(veth); err != nil {
-			return fmt.Errorf("while creating the veth pair: %w", err)
-		}
-		// A link-local IPv6 address would make runsc import atside too.
-		if err := netns.SetSysctls(netns.Sysctl{Key: "net/ipv6/conf/" + gatewayVethName + "/disable_ipv6", Value: "1"}); err != nil {
-			return err
-		}
-		if err := linkUp(gatewayVethName); err != nil {
-			return err
-		}
-		eth0, err := netlink.LinkByName(ActorVethName)
-		if err != nil {
-			return err
-		}
-		if err := netlink.AddrReplace(eth0, ActorVethAddr); err != nil {
-			return fmt.Errorf("while assigning the actor address: %w", err)
-		}
-		if err := netlink.LinkSetUp(eth0); err != nil {
-			return err
-		}
-		return netlink.RouteReplace(&netlink.Route{LinkIndex: eth0.Attrs().Index, Gw: ActorVethGwIP})
-	})
+func setupVethPair() error {
+	// Reuse one namespace-bound socket for all route netlink requests.
+	h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	if err != nil {
+		return fmt.Errorf("while opening the actor netlink socket: %w", err)
+	}
+	defer h.Close()
+
+	eth0 := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: ActorVethName, Flags: net.FlagUp},
+		PeerName:  gatewayVethName,
+	}
+	if err := h.LinkAdd(eth0); err != nil {
+		return fmt.Errorf("while creating the veth pair: %w", err)
+	}
+	// Keep atside down until IPv6 is disabled. A link-local address would
+	// make runsc import it too.
+	if err := netns.SetSysctls(netns.Sysctl{Key: "net/ipv6/conf/" + gatewayVethName + "/disable_ipv6", Value: "1"}); err != nil {
+		return err
+	}
+	gateway, err := h.LinkByName(gatewayVethName)
+	if err != nil {
+		return err
+	}
+	if err := h.LinkSetUp(gateway); err != nil {
+		return err
+	}
+	if err := h.AddrReplace(eth0, ActorVethAddr); err != nil {
+		return fmt.Errorf("while assigning the actor address: %w", err)
+	}
+	return h.RouteReplace(&netlink.Route{LinkIndex: eth0.Attrs().Index, Gw: ActorVethGwIP})
 }
 
 // ActivateGateway assigns the Linux gateway after runsc has imported eth0.
