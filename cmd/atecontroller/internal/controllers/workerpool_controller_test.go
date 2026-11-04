@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -221,6 +222,39 @@ func TestWorkerPoolImageUpdate(t *testing.T) {
 			return false, nil
 		}
 		return dep.Spec.Template.Spec.Containers[0].Image == "worker:v2", nil
+	})
+}
+
+func TestWorkerPoolNamespacePoolUpdate(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	wp := makeWorkerPool("test-namespace-pool", "default", 1, "worker:v1")
+	if err := k8sClient.Create(ctx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	deleteOnCleanup(t, wp)
+
+	updateWorkerPoolSpec(t, ctx, wp, "enable namespace pool", func(current *atev1.WorkerPool) {
+		current.Spec.NetworkNamespacePool = &atev1.WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(32)), StartPaused: ptr.To(false)}
+	})
+	eventually(t, func(ctx context.Context) (bool, error) {
+		dep, err := getDeployment(ctx, wp)
+		if err != nil || len(dep.Spec.Template.Spec.Containers) == 0 {
+			return false, nil
+		}
+		args := dep.Spec.Template.Spec.Containers[0].Args
+		return slices.Contains(args, "--netns-pool-size=32") && slices.Contains(args, "--netns-pool-start-paused=false"), nil
+	})
+
+	updateWorkerPoolSpec(t, ctx, wp, "disable namespace pool", func(current *atev1.WorkerPool) {
+		current.Spec.NetworkNamespacePool = &atev1.WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(0))}
+	})
+	eventually(t, func(ctx context.Context) (bool, error) {
+		dep, err := getDeployment(ctx, wp)
+		if err != nil || len(dep.Spec.Template.Spec.Containers) == 0 {
+			return false, nil
+		}
+		return slices.Contains(dep.Spec.Template.Spec.Containers[0].Args, "--netns-pool-size=0"), nil
 	})
 }
 

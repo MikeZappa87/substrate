@@ -20,9 +20,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 const gpuResourceName = corev1.ResourceName("nvidia.com/gpu")
@@ -49,14 +51,56 @@ func TestWorkerPoolValidation(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		mutate  func(*WorkerPool)
-		wantErr bool
-		errMsg  string
+		name     string
+		mutate   func(*WorkerPool)
+		wantErr  bool
+		errMsg   string
+		wantPool *WorkerPoolNetworkNamespacePool
 	}{{
 		name:    "base worker pool",
 		mutate:  func(wp *WorkerPool) {},
 		wantErr: false,
+	}, {
+		name:     "namespace pool defaults",
+		mutate:   func(wp *WorkerPool) { wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{} },
+		wantPool: &WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(32)), CreationIntervalMilliseconds: ptr.To(int32(100)), WaitTimeoutSeconds: ptr.To(int32(5)), StartPaused: ptr.To(false)},
+	}, {
+		name: "namespace pool starts paused",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(1)), StartPaused: ptr.To(true)}
+		},
+		wantPool: &WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(1)), CreationIntervalMilliseconds: ptr.To(int32(100)), WaitTimeoutSeconds: ptr.To(int32(5)), StartPaused: ptr.To(true)},
+	}, {
+		name: "namespace pool disabled",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(0))}
+		},
+		wantPool: &WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(0)), CreationIntervalMilliseconds: ptr.To(int32(100)), WaitTimeoutSeconds: ptr.To(int32(5)), StartPaused: ptr.To(false)},
+	}, {
+		name: "namespace pool rejects negative size",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(-1))}
+		},
+		wantErr: true, errMsg: "spec.networkNamespacePool.size",
+	}, {
+		name: "namespace pool requires positive interval",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{CreationIntervalMilliseconds: ptr.To(int32(0))}
+		},
+		wantErr: true, errMsg: "spec.networkNamespacePool.creationIntervalMilliseconds",
+	}, {
+		name: "namespace pool requires positive wait",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{WaitTimeoutSeconds: ptr.To(int32(-1))}
+		},
+		wantErr: true, errMsg: "spec.networkNamespacePool.waitTimeoutSeconds",
+	}, {
+		name: "namespace pool rejects microvm",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkNamespacePool = &WorkerPoolNetworkNamespacePool{}
+			wp.Spec.SandboxClasses = []WorkerPoolSandboxClass{{Name: SandboxClassMicroVM}}
+		},
+		wantErr: true, errMsg: "networkNamespacePool requires the gvisor sandbox class",
 	}, {
 		name: "name of 63 characters",
 		mutate: func(wp *WorkerPool) {
@@ -300,6 +344,11 @@ func TestWorkerPoolValidation(t *testing.T) {
 			}
 
 			if err == nil {
+				if tt.wantPool != nil {
+					if diff := cmp.Diff(tt.wantPool, wp.Spec.NetworkNamespacePool); diff != "" {
+						t.Errorf("pool defaults (-want +got):\n%s", diff)
+					}
+				}
 				_ = k8sClient.Delete(ctx, wp)
 			}
 		})

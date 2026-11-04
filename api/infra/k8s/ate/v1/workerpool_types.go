@@ -85,6 +85,7 @@ type WorkerPoolPodTemplate struct {
 	ServiceAccountName *string `json:"serviceAccountName,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.networkNamespacePool) || self.sandboxClasses.all(c, c.name == 'gvisor')",message="networkNamespacePool requires the gvisor sandbox class"
 type WorkerPoolSpec struct {
 	// replicas is the number of worker pods to run.
 	// +required
@@ -95,6 +96,13 @@ type WorkerPoolSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +required
 	WorkerImage string `json:"workerImage"`
+
+	// networkNamespacePool prepares single-use actor networks on each gVisor
+	// worker. Omit it to use worker defaults: size 32 with creation active.
+	// Set size to zero to disable pooling. Changes roll the workers.
+	//
+	// +optional
+	NetworkNamespacePool *WorkerPoolNetworkNamespacePool `json:"networkNamespacePool,omitempty"`
 
 	// template holds optional metadata, scheduling, and resource settings for worker workloads.
 	//
@@ -111,6 +119,41 @@ type WorkerPoolSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	SandboxClasses []WorkerPoolSandboxClass `json:"sandboxClasses,omitempty"`
+}
+
+// WorkerPoolNetworkNamespacePool configures precreation of actor networks.
+type WorkerPoolNetworkNamespacePool struct {
+	// size is the maximum number of unused networks retained per worker.
+	// Acquired networks are destroyed after use and never returned. Defaults
+	// to 32. Zero disables pooling.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=32
+	Size *int32 `json:"size,omitempty"`
+
+	// creationIntervalMilliseconds is the minimum delay after each creation.
+	// One creator runs per worker. Defaults to 100 milliseconds.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=100
+	CreationIntervalMilliseconds *int32 `json:"creationIntervalMilliseconds,omitempty"`
+
+	// waitTimeoutSeconds bounds network checkout and serving setup when an
+	// actor starts. Expiration rejects startup. Defaults to 5 seconds.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=5
+	WaitTimeoutSeconds *int32 `json:"waitTimeoutSeconds,omitempty"`
+
+	// startPaused stops precreation until SIGUSR2 resumes it. SIGUSR1 pauses
+	// creation again. Defaults to false.
+	//
+	// +optional
+	// +kubebuilder:default=false
+	StartPaused *bool `json:"startPaused,omitempty"`
 }
 
 // WorkerPoolSandboxClass is one sandbox runtime family a WorkerPool runs.

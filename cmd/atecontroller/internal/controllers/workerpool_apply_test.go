@@ -232,6 +232,53 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 	}
 }
 
+func TestBuildDeploymentApplyConfigNamespacePool(t *testing.T) {
+	tests := []struct {
+		name  string
+		class atev1.SandboxClass
+		pool  *atev1.WorkerPoolNetworkNamespacePool
+		want  []string
+	}{
+		{name: "gvisor defaults", class: atev1.SandboxClassGvisor},
+		{name: "microvm disabled", class: atev1.SandboxClassMicroVM},
+		{
+			name: "worker defaults", class: atev1.SandboxClassGvisor,
+			pool: &atev1.WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(32))},
+			want: []string{"--netns-pool-size=32"},
+		},
+		{
+			name: "explicitly disabled", class: atev1.SandboxClassGvisor,
+			pool: &atev1.WorkerPoolNetworkNamespacePool{Size: ptr.To(int32(0))},
+			want: []string{"--netns-pool-size=0"},
+		},
+		{
+			name: "configured", class: atev1.SandboxClassGvisor,
+			pool: &atev1.WorkerPoolNetworkNamespacePool{
+				Size: ptr.To(int32(64)), CreationIntervalMilliseconds: ptr.To(int32(250)),
+				WaitTimeoutSeconds: ptr.To(int32(10)), StartPaused: ptr.To(false),
+			},
+			want: []string{"--netns-pool-size=64", "--netns-pool-interval=250ms", "--netns-pool-wait=10s", "--netns-pool-start-paused=false"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wp := testWorkerPoolApplyConfig(nil)
+			wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
+			wp.Spec.NetworkNamespacePool = tt.pool
+			deployment := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
+			var got []string
+			for _, arg := range deployment.Spec.Template.Spec.Containers[0].Args {
+				if strings.HasPrefix(arg, "--netns-pool-") {
+					got = append(got, arg)
+				}
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Fatalf("pool arguments (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(&atev1.WorkerPoolPodTemplate{
 		Labels: map[string]atev1.WorkerPoolLabelValue{

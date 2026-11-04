@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 
@@ -152,6 +153,21 @@ func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, s
 		"--atunnel-egress-trust-bundle="+atunnelEgressTrustMountPath+"/trust-bundle.pem",
 		"--dns-egress-policy="+dnsEgressPolicy,
 	)
+
+	if pool := wp.Spec.NetworkNamespacePool; pool != nil {
+		if pool.Size != nil {
+			args = append(args, fmt.Sprintf("--netns-pool-size=%d", *pool.Size))
+		}
+		if pool.CreationIntervalMilliseconds != nil {
+			args = append(args, fmt.Sprintf("--netns-pool-interval=%dms", *pool.CreationIntervalMilliseconds))
+		}
+		if pool.WaitTimeoutSeconds != nil {
+			args = append(args, fmt.Sprintf("--netns-pool-wait=%ds", *pool.WaitTimeoutSeconds))
+		}
+		if pool.StartPaused != nil {
+			args = append(args, fmt.Sprintf("--netns-pool-start-paused=%t", *pool.StartPaused))
+		}
+	}
 
 	// worker gets preview features when the controller has them.
 	enabledGates := func() []string {

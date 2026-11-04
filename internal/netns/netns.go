@@ -93,6 +93,25 @@ func CreateNamed(name string) (Handle, error) {
 	return interiorNetNS, nil
 }
 
+// BindNamed pins an open namespace under a new name. It never replaces a name.
+func BindNamed(ns Handle, name string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	path := filepath.Join("/run/netns", name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return errors.Join(err, os.Remove(path))
+	}
+	if err := unix.Mount(fmt.Sprintf("/proc/self/fd/%d", ns), path, "", unix.MS_BIND, ""); err != nil {
+		return errors.Join(err, os.Remove(path))
+	}
+	return nil
+}
+
 // RemoveNamed unmounts and unlinks a name under /run/netns, without following
 // it if it is a symlink. A name that is already gone is not an error, and the
 // namespace itself survives for as long as something holds it open.

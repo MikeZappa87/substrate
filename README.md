@@ -141,6 +141,12 @@ kubectl ate create actor my-counter-1 -a ate-demo-counter --template counter
 kubectl ate proxy actor my-counter-1 -a ate-demo-counter
 ```
 
+gVisor workers prepare a pool of 32 single-use actor network namespaces by
+default. Override it through `spec.networkNamespacePool` on the WorkerPool;
+set `size: 0` to disable pooling. See the
+[namespace pool PoC guide](cmd/ateworker-gvisor/netns-pool-poc.md) for configuration
+and scale-suite instructions.
+
 > [!IMPORTANT]
 > `{"name":"k8s.io"}` deploys the bundled credential provider with an empty,
 > default-deny namespace policy. Before an actor can have a credential

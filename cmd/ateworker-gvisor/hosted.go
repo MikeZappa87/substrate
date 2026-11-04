@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -28,6 +29,8 @@ import (
 	"go.ate.dev/substrate/internal/ateworker/actornet"
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
 	"go.ate.dev/substrate/internal/atunnel/ingress"
+	"go.ate.dev/substrate/internal/netns"
+	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/workerstats"
@@ -109,14 +112,32 @@ func (s *AteWorkerService) hostActor(ctx context.Context, attribution resources.
 		}
 	}
 
-	session, err := actornet.ServeSandbox(ctx, actornet.SandboxNetworkConfig{
+	// Lifecycle RPCs serialize this actor. Recover a name left by an earlier
+	// activation whose in-memory session no longer exists.
+	if s.namespacePool != nil {
+		if err := netns.RemoveNamed(nodepath.ActorNetNSName(uid)); err != nil {
+			evict()
+			return nil, fmt.Errorf("while clearing the actor namespace name: %w", err)
+		}
+	}
+	setupCtx := ctx
+	if s.namespacePool != nil {
+		var cancel context.CancelFunc
+		setupCtx, cancel = context.WithTimeout(ctx, s.namespacePoolWait)
+		defer cancel()
+	}
+	session, err := actornet.ServeSandbox(setupCtx, actornet.SandboxNetworkConfig{
 		ActorUID:   uid,
+		Pool:       s.namespacePool,
 		Veth:       true,
 		EgressPort: s.tunnel.EgressPort,
 		DNSPolicy:  s.tunnel.ActorEgressPolicy(attribution),
 	}, s.tunnel.Egress, s.tunnel.DNSRelay)
 	if err != nil {
 		evict()
+		if s.namespacePool != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, apierror.ResourceExhausted("timed out waiting for a prepared actor network")
+		}
 		return nil, fmt.Errorf("while setting up the sandbox network: %w", err)
 	}
 

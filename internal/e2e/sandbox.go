@@ -188,6 +188,9 @@ func fixtureSubstitutions(name string) (inline, blocks map[string]string) {
 		"${TEMPLATE_TRUST_BUNDLE}": "",
 	}
 	if !IsMicroVM() {
+		if image := os.Getenv("E2E_GVISOR_WORKER_IMAGE"); image != "" {
+			inline["${WORKER_IMAGE}"] = image
+		}
 		return inline, blocks
 	}
 

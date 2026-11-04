@@ -132,6 +132,7 @@ func renderTemplates(t *testing.T, relPath string, values map[string]string) []*
 // micro-VM block is gone, no placeholder survives, and the templates select
 // their fixture's pool.
 func TestRenderSubstrateFixtures_GVisor(t *testing.T) {
+	t.Setenv("E2E_GVISOR_WORKER_IMAGE", "")
 	t.Setenv(sandboxClassEnv, "")
 	for _, fixture := range substrateFixtures {
 		t.Run(fixture.manifests.Pool, func(t *testing.T) {
@@ -260,4 +261,20 @@ func TestSubstrateCounterFixture(t *testing.T) {
 			t.Errorf("SubstrateCounterFixture() = %+v, want the environment overrides", got)
 		}
 	})
+}
+
+func TestFixtureWorkerImageOverride(t *testing.T) {
+	t.Setenv("E2E_GVISOR_WORKER_IMAGE", "registry.example/pooled-worker@sha256:abc")
+	for _, tc := range []struct{ name, class, want string }{
+		{"gvisor", "", "registry.example/pooled-worker@sha256:abc"},
+		{"microvm", SandboxClassMicroVM, "ko://go.ate.dev/substrate/cmd/ateworker-microvm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(sandboxClassEnv, tc.class)
+			inline, _ := fixtureSubstitutions("pool")
+			if got := inline["${WORKER_IMAGE}"]; got != tc.want {
+				t.Fatalf("worker image = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

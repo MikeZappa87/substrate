@@ -53,6 +53,9 @@ func (n *SandboxNetwork) holdsNetNS() bool { return n.NetNS > 0 }
 type SandboxNetworkConfig struct {
 	ActorUID string
 
+	// Pool supplies single-use gVisor networks when enabled.
+	Pool *NamespacePool
+
 	// Veth connects gVisor's network stack to the kernel-owned gateway.
 	// MicroVMs use a tap in a single namespace instead.
 	Veth bool
@@ -72,7 +75,21 @@ type SandboxNetworkConfig struct {
 // nftables at the sandbox's default gateway redirect outbound TCP to atunnel, preserving
 // SO_ORIGINAL_DST. Traffic to the gateway address is not redirected, so DNS
 // over UDP and TCP reaches the relay's own sockets.
-func SetupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig) (_ *SandboxNetwork, retErr error) {
+func SetupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig) (*SandboxNetwork, error) {
+	if cfg.Pool != nil {
+		if !cfg.Veth {
+			return nil, fmt.Errorf("namespace pool requires gVisor veth networking")
+		}
+		if cfg.EgressPort != cfg.Pool.port {
+			return nil, fmt.Errorf("namespace pool egress port mismatch")
+		}
+		return cfg.Pool.Acquire(ctx, cfg.ActorUID)
+	}
+	return setupSandboxNetwork(ctx, cfg, false)
+}
+
+// setupSandboxNetwork disables IPv6 for pooled gVisor namespaces before links exist.
+func setupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig, disableIPv6 bool) (_ *SandboxNetwork, retErr error) {
 	actorUID := cfg.ActorUID
 	if actorUID == "" {
 		return nil, fmt.Errorf("actornet: actor UID is required")
@@ -85,11 +102,20 @@ func SetupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig) (_ *Sand
 	}
 	defer func() {
 		if retErr != nil {
-			actorNS.Close()
-			_ = netns.RemoveNamed(actorNSName)
+			retErr = errors.Join(retErr, actorNS.Close(), netns.RemoveNamed(actorNSName))
 		}
 	}()
-	if err := netns.Do(ctx, actorNS, prepareNamespace); err != nil {
+	if err := netns.Do(ctx, actorNS, func(ctx context.Context) error {
+		if disableIPv6 {
+			if err := netns.SetSysctls(
+				netns.Sysctl{Key: "net/ipv6/conf/all/disable_ipv6", Value: "1"},
+				netns.Sysctl{Key: "net/ipv6/conf/default/disable_ipv6", Value: "1"},
+			); err != nil {
+				return err
+			}
+		}
+		return prepareNamespace(ctx)
+	}); err != nil {
 		return nil, err
 	}
 

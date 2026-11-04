@@ -107,6 +107,10 @@ var (
 	tunnelConfig = atunnel.RegisterFlags(pflag.CommandLine)
 
 	readinessListenAddress = pflag.String("readiness-listen-address", "0.0.0.0:8080", "Address for the HTTP /readyz and /healthz probes")
+	namespacePoolSize      = pflag.Int("netns-pool-size", 32, "Prepared single-use gVisor networks; zero disables pooling")
+	namespacePoolInterval  = pflag.Duration("netns-pool-interval", 100*time.Millisecond, "Minimum delay between network creations by the single pool creator")
+	namespacePoolWait      = pflag.Duration("netns-pool-wait", 5*time.Second, "Maximum wait for a prepared network before rejecting startup")
+	namespacePoolPaused    = pflag.Bool("netns-pool-start-paused", false, "Start replenishment paused; SIGUSR2 resumes and SIGUSR1 pauses it")
 	maxActors              = pflag.Int("max-actors", 1000, "How many actors this worker will host at once")
 	usageSampleInterval    = pflag.Duration("usage-sample-interval", time.Minute, "How often the ateworker samples the resource usage of its actors. Each sample writes an ate.actor.usage_sampled record per actor, and GetActiveWorkloadStats serves the latest.")
 
@@ -158,6 +162,9 @@ func do(ctx context.Context) error {
 	}
 
 	slog.InfoContext(ctx, "ateworker booting", slog.String("version", version.Version))
+	if *namespacePoolSize < 0 || *namespacePoolInterval <= 0 || *namespacePoolWait <= 0 {
+		return fmt.Errorf("netns pool size must be nonnegative and interval and wait must be positive")
+	}
 	if *maxActors < 0 {
 		return fmt.Errorf("--max-actors must not be negative, got %d", *maxActors)
 	}
@@ -267,7 +274,21 @@ func do(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ateworkerService := NewService(tunnel, actorLogger, *maxActors, flags, bootID)
+	var networkPool *actornet.NamespacePool
+	if *namespacePoolSize > 0 {
+		networkPool, err = actornet.NewNamespacePool(*namespacePoolSize, *namespacePoolInterval, tunnel.EgressPort, *namespacePoolPaused)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := networkPool.Close(); err != nil {
+				slog.ErrorContext(ctx, "Failed to close namespace pool", "err", err)
+			}
+		}()
+		stopControls := watchNamespacePoolSignals(ctx, networkPool)
+		defer stopControls()
+	}
+	ateworkerService := NewService(tunnel, actorLogger, *maxActors, flags, bootID, networkPool, *namespacePoolWait)
 	ateworkerService.throttleMemory = cgroup.PSIEnabled(defaultCgroupRoot)
 	if !ateworkerService.throttleMemory {
 		slog.WarnContext(ctx, "Kernel has no cgroup memory pressure (PSI), so sandboxes keep memory.max and an OOM kill in one can restart the worker")
@@ -385,8 +406,10 @@ type AteWorkerService struct {
 	draining  int
 	maxActors int
 
-	actorLogger *actorlog.ActorLogger
-	tunnel      *atunnel.Tunnel
+	actorLogger       *actorlog.ActorLogger
+	tunnel            *atunnel.Tunnel
+	namespacePool     *actornet.NamespacePool
+	namespacePoolWait time.Duration
 	// usage writes the usage records. Nil writes none.
 	usage *workerstats.UsageEmitter
 
@@ -428,19 +451,21 @@ type AteWorkerService struct {
 var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
 
 // NewService creates a new AteWorkerService.
-func NewService(tunnel *atunnel.Tunnel, actorLogger *actorlog.ActorLogger, maxActors int, flags *flagStore, bootID string) *AteWorkerService {
+func NewService(tunnel *atunnel.Tunnel, actorLogger *actorlog.ActorLogger, maxActors int, flags *flagStore, bootID string, pool *actornet.NamespacePool, poolWait time.Duration) *AteWorkerService {
 	s := &AteWorkerService{
-		locks:            actorlock.New(),
-		inFlight:         actorlock.NewInFlight(),
-		actors:           map[string]*hostedActor{},
-		maxActors:        maxActors,
-		tunnel:           tunnel,
-		actorLogger:      actorLogger,
-		cgroupRoot:       defaultCgroupRoot,
-		flags:            flags,
-		checkpointWrites: make(chan struct{}, checkpointWriteSlots),
-		bootID:           bootID,
-		enableCoreTags:   checkCoreTagsSupported(),
+		locks:             actorlock.New(),
+		inFlight:          actorlock.NewInFlight(),
+		actors:            map[string]*hostedActor{},
+		maxActors:         maxActors,
+		tunnel:            tunnel,
+		namespacePool:     pool,
+		namespacePoolWait: poolWait,
+		actorLogger:       actorLogger,
+		cgroupRoot:        defaultCgroupRoot,
+		flags:             flags,
+		checkpointWrites:  make(chan struct{}, checkpointWriteSlots),
+		bootID:            bootID,
+		enableCoreTags:    checkCoreTagsSupported(),
 	}
 	s.borrow = &memborrow.Ledger{Unbooked: s.unbookedMemory}
 	return s
@@ -481,6 +506,11 @@ func (s *AteWorkerService) gracefulShutdown(ctx context.Context) {
 	// less disruptive than waiting for it to complete and then immediately sending
 	// a SIGTERM.
 	cancelStartups(ctx, s.inFlight)
+	if s.namespacePool != nil {
+		if err := s.namespacePool.Close(); err != nil {
+			slog.ErrorContext(ctx, "Failed to close namespace pool", "err", err)
+		}
+	}
 
 	// One deadline covers the whole drain. Waiting for the lock and waiting out
 	// SIGTERM below both run against it, so the two phases split a single grace
